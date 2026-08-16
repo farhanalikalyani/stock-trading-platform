@@ -1,0 +1,497 @@
+/*
+ * Click nbfs://nbhost/SystemFileSystem/Templates/Licenses/license-default.txt to change this license
+ */
+
+package com.mycompany.codealfa_2;
+
+/**
+ *
+ * @author Naveed
+ */
+import java.io.*;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+
+/**
+ * ============================================================
+ *  STOCK TRADING SIMULATOR
+ * ============================================================
+ * A console-based, OOP stock trading environment featuring:
+ *   - Live-style market data with simulated price movement
+ *   - Buy / Sell operations against a virtual cash balance
+ *   - Portfolio tracking with average cost basis & profit/loss
+ *   - Full transaction history log
+ *   - Persistence via Java object serialization (.dat file),
+ *     so a trader's portfolio survives between program runs
+ *
+ * Class layout:
+ *   Ticker            -> a single tradable stock & its price engine
+ *   TradeRecord        -> an immutable record of one buy/sell event
+ *   Holding             -> quantity + average cost basis for one symbol
+ *   TraderAccount      -> a user's cash, holdings, and trade history
+ *   ExchangeFloor      -> the "market" - owns all Tickers, simulates ticks
+ *   StockTradingSimulator -> console UI / program entry point
+ * ============================================================
+ */
+
+public class CodeAlfa_2 {
+    public static void main(String[] args) {
+        ExchangeFloor exchange = new ExchangeFloor();
+        exchange.seedDefaultListings();
+
+        TraderConsole console = new TraderConsole(exchange);
+        console.launch();
+    }
+}
+
+// ================================================================
+//  TICKER  -  represents one listed stock and its own price engine
+// ================================================================
+class Ticker implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final String symbol;
+    private final String companyName;
+    private double currentPrice;
+    private double previousClose;
+    private final double volatility; // fraction, e.g. 0.02 = 2% typical swing
+    private final Random rng = new Random();
+
+    public Ticker(String symbol, String companyName, double startingPrice, double volatility) {
+        this.symbol = symbol;
+        this.companyName = companyName;
+        this.currentPrice = startingPrice;
+        this.previousClose = startingPrice;
+        this.volatility = volatility;
+    }
+
+    /** Simulates one market "tick" using a simple random-walk model. */
+    public void simulateTick() {
+        previousClose = currentPrice;
+        double changePercent = (rng.nextGaussian()) * volatility;
+        double newPrice = currentPrice * (1 + changePercent);
+        currentPrice = Math.max(0.50, roundToCents(newPrice)); // floor so price never hits 0
+    }
+
+    private double roundToCents(double value) {
+        return Math.round(value * 100.0) / 100.0;
+    }
+
+    public double getChangeAmount() {
+        return roundToCents(currentPrice - previousClose);
+    }
+
+    public double getChangePercent() {
+        if (previousClose == 0) return 0;
+        return roundToCents(((currentPrice - previousClose) / previousClose) * 100.0);
+    }
+
+    public String getSymbol() { return symbol; }
+    public String getCompanyName() { return companyName; }
+    public double getCurrentPrice() { return currentPrice; }
+
+    @Override
+    public String toString() {
+        String arrow = getChangeAmount() >= 0 ? "▲" : "▼";
+        return String.format("%-6s %-22s $%-10.2f %s %-7.2f (%.2f%%)",
+                symbol, companyName, currentPrice, arrow,
+                Math.abs(getChangeAmount()), getChangePercent());
+    }
+}
+
+// ================================================================
+//  TRADE RECORD  -  an immutable log entry for one buy or sell
+// ================================================================
+class TradeRecord implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    enum Action { BUY, SELL }
+
+    private final Action action;
+    private final String symbol;
+    private final int quantity;
+    private final double pricePerShare;
+    private final String timestamp;
+
+    public TradeRecord(Action action, String symbol, int quantity, double pricePerShare) {
+        this.action = action;
+        this.symbol = symbol;
+        this.quantity = quantity;
+        this.pricePerShare = pricePerShare;
+        this.timestamp = LocalDateTime.now()
+                .format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss"));
+    }
+
+    public double getTotalValue() { return quantity * pricePerShare; }
+
+    @Override
+    public String toString() {
+        return String.format("[%s] %-4s %4d x %-6s @ $%-8.2f = $%-10.2f",
+                timestamp, action, quantity, symbol, pricePerShare, getTotalValue());
+    }
+}
+
+// ================================================================
+//  HOLDING  -  quantity + average cost basis for one owned symbol
+// ================================================================
+class Holding implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final String symbol;
+    private int quantity;
+    private double averageCost;
+
+    public Holding(String symbol, int quantity, double averageCost) {
+        this.symbol = symbol;
+        this.quantity = quantity;
+        this.averageCost = averageCost;
+    }
+
+    /** Blends new purchase into the existing average cost basis. */
+    public void addShares(int addedQty, double buyPrice) {
+        double totalCostBefore = quantity * averageCost;
+        double totalCostAdded = addedQty * buyPrice;
+        quantity += addedQty;
+        averageCost = (totalCostBefore + totalCostAdded) / quantity;
+    }
+
+    /** Returns true if the holding is now empty and should be removed. */
+    public boolean removeShares(int removedQty) {
+        quantity -= removedQty;
+        return quantity <= 0;
+    }
+
+    public String getSymbol() { return symbol; }
+    public int getQuantity() { return quantity; }
+    public double getAverageCost() { return averageCost; }
+}
+
+// ================================================================
+//  TRADER ACCOUNT  -  a user's cash, holdings, and history
+// ================================================================
+class TraderAccount implements Serializable {
+    private static final long serialVersionUID = 1L;
+
+    private final String username;
+    private double cashBalance;
+    private final double startingCapital;
+    private final Map<String, Holding> holdings = new LinkedHashMap<>();
+    private final List<TradeRecord> history = new ArrayList<>();
+
+    public TraderAccount(String username, double startingCapital) {
+        this.username = username;
+        this.cashBalance = startingCapital;
+        this.startingCapital = startingCapital;
+    }
+
+    public boolean buy(Ticker ticker, int quantity) {
+        double cost = ticker.getCurrentPrice() * quantity;
+        if (cost > cashBalance) return false;
+
+        cashBalance -= cost;
+        holdings.merge(ticker.getSymbol(),
+                new Holding(ticker.getSymbol(), quantity, ticker.getCurrentPrice()),
+                (existing, incoming) -> {
+                    existing.addShares(quantity, ticker.getCurrentPrice());
+                    return existing;
+                });
+        history.add(new TradeRecord(TradeRecord.Action.BUY, ticker.getSymbol(), quantity, ticker.getCurrentPrice()));
+        return true;
+    }
+
+    public boolean sell(Ticker ticker, int quantity) {
+        Holding h = holdings.get(ticker.getSymbol());
+        if (h == null || h.getQuantity() < quantity) return false;
+
+        double proceeds = ticker.getCurrentPrice() * quantity;
+        cashBalance += proceeds;
+        boolean nowEmpty = h.removeShares(quantity);
+        if (nowEmpty) holdings.remove(ticker.getSymbol());
+
+        history.add(new TradeRecord(TradeRecord.Action.SELL, ticker.getSymbol(), quantity, ticker.getCurrentPrice()));
+        return true;
+    }
+
+    public double getPortfolioMarketValue(ExchangeFloor exchange) {
+        double total = 0;
+        for (Holding h : holdings.values()) {
+            Ticker t = exchange.findTicker(h.getSymbol());
+            if (t != null) total += t.getCurrentPrice() * h.getQuantity();
+        }
+        return total;
+    }
+
+    public double getNetWorth(ExchangeFloor exchange) {
+        return cashBalance + getPortfolioMarketValue(exchange);
+    }
+
+    public double getOverallProfitLoss(ExchangeFloor exchange) {
+        return getNetWorth(exchange) - startingCapital;
+    }
+
+    public String getUsername() { return username; }
+    public double getCashBalance() { return cashBalance; }
+    public Map<String, Holding> getHoldings() { return holdings; }
+    public List<TradeRecord> getHistory() { return history; }
+    public double getStartingCapital() { return startingCapital; }
+}
+
+// ================================================================
+//  EXCHANGE FLOOR  -  owns all listed Tickers, simulates the market
+// ================================================================
+class ExchangeFloor {
+    private final Map<String, Ticker> listings = new LinkedHashMap<>();
+
+    public void seedDefaultListings() {
+        addListing(new Ticker("TCHX", "TechCore Industries", 148.32, 0.025));
+        addListing(new Ticker("NEXG", "NexGen Energy",        62.15, 0.035));
+        addListing(new Ticker("BLUM", "BlueMoon Retail",      34.80, 0.020));
+        addListing(new Ticker("ARIA", "Aria Biosciences",     89.47, 0.045));
+        addListing(new Ticker("FNVT", "FinVault Holdings",   210.60, 0.018));
+    }
+
+    public void addListing(Ticker t) { listings.put(t.getSymbol(), t); }
+
+    public Ticker findTicker(String symbol) { return listings.get(symbol.toUpperCase()); }
+
+    public Collection<Ticker> getAllListings() { return listings.values(); }
+
+    /** Advances every stock's price by one simulated tick. */
+    public void tickMarket() {
+        for (Ticker t : listings.values()) t.simulateTick();
+    }
+}
+
+// ================================================================
+//  TRADER CONSOLE  -  the interactive menu / program flow
+// ================================================================
+class TraderConsole {
+    private final ExchangeFloor exchange;
+    private final Scanner scanner = new Scanner(System.in);
+    private TraderAccount account;
+    private static final double DEFAULT_STARTING_CAPITAL = 10_000.00;
+
+    public TraderConsole(ExchangeFloor exchange) {
+        this.exchange = exchange;
+    }
+
+    public void launch() {
+        printBanner();
+        onboardTrader();
+
+        boolean running = true;
+        while (running) {
+            exchange.tickMarket(); // market moves a little each time the menu shows
+            printMenu();
+            int choice = readInt("Enter your choice: ");
+
+            switch (choice) {
+                case 1 -> displayMarketData();
+                case 2 -> executeBuy();
+                case 3 -> executeSell();
+                case 4 -> displayPortfolio();
+                case 5 -> displayTransactionHistory();
+                case 6 -> saveAccount();
+                case 7 -> {
+                    System.out.println("\nSaving before exit...");
+                    saveAccount();
+                    System.out.println("Goodbye, " + account.getUsername() + "!");
+                    running = false;
+                }
+                default -> System.out.println("Invalid choice, please select 1-7.");
+            }
+        }
+        scanner.close();
+    }
+
+    private void printBanner() {
+        System.out.println("==================================================");
+        System.out.println("        STOCK TRADING SIMULATOR - EXCHANGE       ");
+        System.out.println("==================================================");
+    }
+
+    private void onboardTrader() {
+        System.out.print("Enter your trader username: ");
+        String username = scanner.nextLine().trim();
+        String saveFile = buildSaveFileName(username);
+
+        File existing = new File(saveFile);
+        if (existing.exists()) {
+            TraderAccount loaded = loadAccount(saveFile);
+            if (loaded != null) {
+                account = loaded;
+                System.out.println("Welcome back, " + username + "! Portfolio restored from disk.");
+                return;
+            }
+        }
+
+        System.out.println("No saved portfolio found. Creating a new account.");
+        account = new TraderAccount(username, DEFAULT_STARTING_CAPITAL);
+        System.out.printf("Starting cash balance: $%.2f%n", DEFAULT_STARTING_CAPITAL);
+    }
+
+    private void printMenu() {
+        System.out.println("\n-------------------- MENU --------------------");
+        System.out.println("1. View market data");
+        System.out.println("2. Buy shares");
+        System.out.println("3. Sell shares");
+        System.out.println("4. View portfolio performance");
+        System.out.println("5. View transaction history");
+        System.out.println("6. Save portfolio now");
+        System.out.println("7. Save & exit");
+        System.out.println("------------------------------------------------");
+    }
+
+    private void displayMarketData() {
+        System.out.println("\n=============== LIVE MARKET DATA ===============");
+        System.out.printf("%-6s %-22s %-11s %-16s%n", "SYM", "COMPANY", "PRICE", "CHANGE");
+        System.out.println("--------------------------------------------------");
+        for (Ticker t : exchange.getAllListings()) {
+            System.out.println(t);
+        }
+        System.out.println("==================================================");
+    }
+
+    private void executeBuy() {
+        Ticker ticker = promptForTicker();
+        if (ticker == null) return;
+
+        System.out.printf("Current price of %s: $%.2f%n", ticker.getSymbol(), ticker.getCurrentPrice());
+        int qty = readInt("Quantity to buy: ");
+        if (qty <= 0) {
+            System.out.println("Quantity must be positive.");
+            return;
+        }
+
+        double totalCost = qty * ticker.getCurrentPrice();
+        System.out.printf("Total cost: $%.2f  |  Available cash: $%.2f%n", totalCost, account.getCashBalance());
+
+        if (account.buy(ticker, qty)) {
+            System.out.println("Order filled: bought " + qty + " share(s) of " + ticker.getSymbol() + ".");
+        } else {
+            System.out.println("Insufficient funds for this order.");
+        }
+    }
+
+    private void executeSell() {
+        Ticker ticker = promptForTicker();
+        if (ticker == null) return;
+
+        Holding h = account.getHoldings().get(ticker.getSymbol());
+        if (h == null) {
+            System.out.println("You don't own any shares of " + ticker.getSymbol() + ".");
+            return;
+        }
+
+        System.out.printf("You currently hold %d share(s) of %s (avg cost $%.2f).%n",
+                h.getQuantity(), ticker.getSymbol(), h.getAverageCost());
+        int qty = readInt("Quantity to sell: ");
+        if (qty <= 0) {
+            System.out.println("Quantity must be positive.");
+            return;
+        }
+
+        double proceeds = qty * ticker.getCurrentPrice();
+        if (account.sell(ticker, qty)) {
+            System.out.printf("Order filled: sold %d share(s) of %s for $%.2f.%n", qty, ticker.getSymbol(), proceeds);
+        } else {
+            System.out.println("You don't have enough shares to sell that quantity.");
+        }
+    }
+
+    private Ticker promptForTicker() {
+        System.out.print("Enter stock symbol (e.g. TCHX): ");
+        String symbol = scanner.nextLine().trim().toUpperCase();
+        Ticker t = exchange.findTicker(symbol);
+        if (t == null) {
+            System.out.println("No such symbol listed on the exchange.");
+            return null;
+        }
+        return t;
+    }
+
+    private void displayPortfolio() {
+        System.out.println("\n============= PORTFOLIO PERFORMANCE =============");
+        System.out.println("Trader        : " + account.getUsername());
+        System.out.printf("Cash balance   : $%.2f%n", account.getCashBalance());
+
+        if (account.getHoldings().isEmpty()) {
+            System.out.println("No open positions.");
+        } else {
+            System.out.printf("%n%-6s %-8s %-12s %-12s %-12s %-10s%n",
+                    "SYM", "QTY", "AVG COST", "CUR PRICE", "MKT VALUE", "P/L");
+            System.out.println("---------------------------------------------------------------");
+            for (Holding h : account.getHoldings().values()) {
+                Ticker t = exchange.findTicker(h.getSymbol());
+                double curPrice = t.getCurrentPrice();
+                double mktValue = curPrice * h.getQuantity();
+                double pl = (curPrice - h.getAverageCost()) * h.getQuantity();
+                System.out.printf("%-6s %-8d $%-11.2f $%-11.2f $%-11.2f %s$%.2f%n",
+                        h.getSymbol(), h.getQuantity(), h.getAverageCost(), curPrice, mktValue,
+                        pl >= 0 ? "+" : "-", Math.abs(pl));
+            }
+        }
+
+        double netWorth = account.getNetWorth(exchange);
+        double overallPL = account.getOverallProfitLoss(exchange);
+        System.out.println("-----------------------------------------------------------------");
+        System.out.printf("Starting capital : $%.2f%n", account.getStartingCapital());
+        System.out.printf("Net worth        : $%.2f%n", netWorth);
+        System.out.printf("Overall P/L      : %s$%.2f (%.2f%%)%n",
+                overallPL >= 0 ? "+" : "-", Math.abs(overallPL),
+                (overallPL / account.getStartingCapital()) * 100.0);
+        System.out.println("===================================================================");
+    }
+
+    private void displayTransactionHistory() {
+        System.out.println("\n=============== TRANSACTION HISTORY ===============");
+        if (account.getHistory().isEmpty()) {
+            System.out.println("No trades recorded yet.");
+        } else {
+            for (TradeRecord r : account.getHistory()) {
+                System.out.println(r);
+            }
+        }
+        System.out.println("=====================================================");
+    }
+
+    // ---------- Persistence (Java Serialization) ----------
+
+    private String buildSaveFileName(String username) {
+        return "portfolio_" + username.toLowerCase().replaceAll("\\s+", "_") + ".dat";
+    }
+
+    private void saveAccount() {
+        String fileName = buildSaveFileName(account.getUsername());
+        try (ObjectOutputStream out = new ObjectOutputStream(new FileOutputStream(fileName))) {
+            out.writeObject(account);
+            System.out.println("Portfolio saved to " + fileName);
+        } catch (IOException e) {
+            System.out.println("Error saving portfolio: " + e.getMessage());
+        }
+    }
+
+    private TraderAccount loadAccount(String fileName) {
+        try (ObjectInputStream in = new ObjectInputStream(new FileInputStream(fileName))) {
+            return (TraderAccount) in.readObject();
+        } catch (IOException | ClassNotFoundException e) {
+            System.out.println("Error loading saved portfolio: " + e.getMessage());
+            return null;
+        }
+    }
+
+    // ---------- Input helpers ----------
+
+    private int readInt(String prompt) {
+        while (true) {
+            System.out.print(prompt);
+            String line = scanner.nextLine().trim();
+            try {
+                return Integer.parseInt(line);
+            } catch (NumberFormatException e) {
+                System.out.println("Please enter a valid whole number.");
+            }
+        }
+    }
+}
